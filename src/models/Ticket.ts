@@ -211,30 +211,29 @@ const ticketSchema = new mongoose.Schema<ITicket>(
         trim: true,
       },
     },
+    // ─── FIXED: plain nested object (previously wrapped in `type: { ... }`) ───
     guardian: {
-      type: {
-        firstName: {
-          type: String,
-          default: "",
-          trim: true,
-        },
-        lastName: {
-          type: String,
-          default: "",
-          trim: true,
-        },
-        middleName: {
-          type: String,
-          default: "",
-          trim: true,
-        },
-        relationship: {
-          type: String,
-          enum: [...VALID_RELATIONSHIPS, ""],
-          default: "",
-        },
+      firstName: {
+        type: String,
+        default: "",
+        trim: true,
       },
-      default: undefined,
+      lastName: {
+        type: String,
+        default: "",
+        trim: true,
+      },
+      middleName: {
+        type: String,
+        default: "",
+        trim: true,
+      },
+      relationship: {
+        type: String,
+        enum: [...VALID_RELATIONSHIPS, ""],
+        default: "",
+      },
+      _id: false,
     },
     statusHistory: {
       type: [StatusTrackingSchema],

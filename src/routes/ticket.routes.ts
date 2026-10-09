@@ -80,7 +80,102 @@ function toPublic(t: ITicket) {
   };
 }
 
+/**
+ * Queue status for a ticket.
+ *
+ * ── Cashier ────────────────────────────────────────────────────────────
+ * `peopleAhead` counts pending tickets assigned to the SAME window with an
+ * earlier `createdAt`. Because the cashier dashboard doesn't reliably flip
+ * tickets to "serving" when called, the oldest pending ticket in a window
+ * is treated as "at the counter" and subtracted from the count.
+ *
+ * `nowServing` is scoped to the same window. `assignedWindow` is returned
+ * so the mobile app can display "Window 2" etc.
+ *
+ * ── Dean / Registrar / any other single-lane dept ──────────────────────
+ * Falls through to the original department-wide FIFO count.
+ * `assignedWindow` is always `null`.
+ */
 async function getQueueInfo(t: ITicket) {
+  // ─────────────────────────────────────────────────────────────────────
+  // CASHIER: per-window scoping
+  // ─────────────────────────────────────────────────────────────────────
+  if (t.department === "cashier") {
+    // 1. Resolve the ticket's own window.
+    let ownWindow: string | null = null;
+    let windowStaffIds: string[] = [];
+
+    const ownerId = t.servedBy || t.assignedTo;
+    if (ownerId) {
+      const owner = await Staff.findOne({ staffId: ownerId })
+        .select("cashierWindow")
+        .lean();
+      ownWindow = String((owner as any)?.cashierWindow || "").trim() || null;
+
+      if (ownWindow) {
+        const windowStaff = await Staff.find({
+          roleName: "cashier",
+          status: "active",
+          cashierWindow: ownWindow,
+        })
+          .select("staffId")
+          .lean();
+        windowStaffIds = (windowStaff as any[]).map((s) => s.staffId);
+      }
+    }
+
+    // 2. Count tickets ahead of this one WITHIN THE SAME WINDOW.
+    let peopleAhead = 0;
+    if (t.status === "pending" && ownWindow && windowStaffIds.length > 0) {
+      const rawAhead = await Ticket.countDocuments({
+        department: "cashier",
+        status: "pending",
+        createdAt: { $gte: startOfManilaDay(t.createdAt), $lt: t.createdAt },
+        $or: [
+          { assignedTo: { $in: windowStaffIds } },
+          { servedBy: { $in: windowStaffIds } },
+        ],
+      });
+
+      // The oldest pending ticket in this window is the one currently at
+      // the counter (even if its status hasn't been flipped to "serving"
+      // yet). Subtract it so the next student sees "You're next".
+      peopleAhead = Math.max(0, rawAhead - 1);
+    }
+
+    // 3. "Now serving" scoped to the same window.
+    let nowServing: {
+      ticketNumber: string;
+      window: string | null;
+    } | null = null;
+
+    if (ownWindow && windowStaffIds.length > 0) {
+      const serving = await Ticket.findOne({
+        department: "cashier",
+        status: "serving",
+        $or: [
+          { servedBy: { $in: windowStaffIds } },
+          { assignedTo: { $in: windowStaffIds } },
+        ],
+      })
+        .sort({ servedAt: -1 })
+        .select("ticketNumber servingWindow")
+        .lean();
+
+      if (serving) {
+        nowServing = {
+          ticketNumber: (serving as any).ticketNumber,
+          window: ownWindow,
+        };
+      }
+    }
+
+    return { peopleAhead, nowServing, assignedWindow: ownWindow };
+  }
+
+  // ─────────────────────────────────────────────────────────────────────
+  // DEAN (and any other single-lane dept): original behavior
+  // ─────────────────────────────────────────────────────────────────────
   const [peopleAhead, serving] = await Promise.all([
     t.status === "pending"
       ? Ticket.countDocuments({
@@ -99,13 +194,11 @@ async function getQueueInfo(t: ITicket) {
     nowServing: serving
       ? { ticketNumber: serving.ticketNumber, window: serving.servingWindow }
       : null,
+    assignedWindow: null,
   };
 }
 
 // ─── GET /api/tickets/live ─────────────────────────────────────────────────
-// Full live queue with staff per cashier window.
-// Only Cashier and Dean are returned (Registrar uses a separate request flow).
-// Must be registered BEFORE "/:ticketId" so the dynamic matcher doesn't grab it.
 router.get(
   "/live",
   asyncHandler(async (_req, res) => {
@@ -116,13 +209,11 @@ router.get(
 
     const result = await Promise.all(
       departments.map(async (dept) => {
-        // All active staff for this department
         const staffList = await Staff.find({
           roleName: dept,
           status: "active",
         }).lean();
 
-        // All active tickets today for this department
         const tickets = await Ticket.find({
           department: dept,
           status: { $in: ["pending", "serving"] },
@@ -135,10 +226,9 @@ router.get(
         if (dept === "cashier") {
           const windows: Record<string, any> = {};
 
-          // Only create windows from staff who actually have a cashierWindow set
           for (const s of staffList as any[]) {
             const windowName = String(s.cashierWindow || "").trim();
-            if (!windowName) continue; // skip staff without a window
+            if (!windowName) continue;
 
             if (!windows[windowName]) {
               windows[windowName] = {
@@ -154,7 +244,6 @@ router.get(
             };
           }
 
-          // If nobody has a window set, fall back to Window 1 / 2 / 3 placeholders
           if (Object.keys(windows).length === 0) {
             for (let i = 1; i <= 3; i++) {
               const name = `Window ${i}`;
@@ -167,14 +256,22 @@ router.get(
             }
           }
 
-          // Distribute tickets into their window buckets
           for (const t of tickets as any[]) {
             const ownerId = t.servedBy || t.assignedTo;
             const owner = (staffList as any[]).find(
               (s) => s.staffId === ownerId,
             );
-            const windowName = String(owner?.cashierWindow || "").trim();
-            if (!windowName || !windows[windowName]) continue; // skip unassigned
+            let windowName = String(owner?.cashierWindow || "").trim();
+            if (!windowName) windowName = "Unassigned";
+
+            if (!windows[windowName]) {
+              windows[windowName] = {
+                window: windowName,
+                staff: null,
+                serving: null,
+                waiting: [],
+              };
+            }
 
             const ticketPayload = {
               ticketNumber: t.ticketNumber,
@@ -190,8 +287,11 @@ router.get(
             }
           }
 
-          // Sort: Window 1, Window 2, Window 3, then anything else alphabetically
           const ordered = Object.values(windows).sort((a: any, b: any) => {
+            const aUnassigned = a.window === "Unassigned";
+            const bUnassigned = b.window === "Unassigned";
+            if (aUnassigned !== bUnassigned) return aUnassigned ? 1 : -1;
+
             const na = parseInt(String(a.window).replace(/\D/g, ""), 10) || 999;
             const nb = parseInt(String(b.window).replace(/\D/g, ""), 10) || 999;
             if (na !== nb) return na - nb;
@@ -265,7 +365,7 @@ router.get(
   }),
 );
 
-// GET /api/tickets/queue/:department — who is being served + how many wait
+// GET /api/tickets/queue/:department
 router.get(
   "/queue/:department",
   validate(departmentParam, "params"),
@@ -299,7 +399,7 @@ router.get(
   }),
 );
 
-// POST /api/tickets — create a ticket (counter-based, matches web app)
+// POST /api/tickets — create a ticket
 router.post(
   "/",
   createTicketLimiter,
@@ -315,7 +415,6 @@ router.post(
       amount,
     } = req.body;
 
-    // The transaction must belong to the chosen department
     const allowed = DEPARTMENT_TRANSACTIONS[department];
     if (!allowed || !allowed.includes(transactionType)) {
       throw new AppError(
@@ -324,14 +423,12 @@ router.post(
       );
     }
 
-    // Zod keeps email/contact inside student or guardian; the model keeps them in requester
     const contact = requesterType === "guardian" ? guardian : student;
     const email = contact?.email?.trim().toLowerCase();
     if (!email) {
       throw new AppError("Email is required to get a queue number.", 400);
     }
 
-    // One active ticket per email (any department) per day
     const active = await Ticket.findOne({
       "requester.email": email,
       status: { $in: ["pending", "serving"] },
@@ -349,7 +446,6 @@ router.post(
 
     const { email: _se, contactNumber: _sc, ...studentDoc } = student;
 
-    // Idempotency key from header, or generate one
     const idempotencyKey =
       (req.header("x-idempotency-key") as string | undefined) ||
       `${email}:${department}:${transactionType}`;
@@ -458,7 +554,7 @@ router.post(
   }),
 );
 
-// GET /api/tickets/:ticketId — live status (the app polls this)
+// GET /api/tickets/:ticketId
 router.get(
   "/:ticketId",
   validate(ticketIdParam, "params"),
@@ -475,7 +571,7 @@ router.get(
   }),
 );
 
-// PATCH /api/tickets/:ticketId/cancel — student cancels while still waiting
+// PATCH /api/tickets/:ticketId/cancel
 router.patch(
   "/:ticketId/cancel",
   validate(ticketIdParam, "params"),
