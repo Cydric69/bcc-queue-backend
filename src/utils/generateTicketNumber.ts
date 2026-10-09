@@ -3,6 +3,7 @@ import Counter from "../models/Counter";
 import Staff from "../models/Staff";
 import SystemSetting, { SYSTEM_SETTINGS_ID } from "../models/SystemSetting";
 import { startOfManilaDay } from "./queue";
+import { chooseCashierStaffForNextTicket } from "./loadBalancer";
 
 export type DistributionFailureReason =
   | "queue-closed"
@@ -129,7 +130,18 @@ async function distributeTicketNumber(
 
     const nextNumber = (result as any).seq || 1;
     const ticketNumber = String(nextNumber);
-    const ticketId = `${(staff as any).roleName}-${staffId}-${dateStr}-${String(nextNumber).padStart(4, "0")}`;
+    const ticketId = `${(staff as any).roleName}-${staffId}-${dateStr}-${String(
+      nextNumber,
+    ).padStart(4, "0")}`;
+
+    console.log(
+      "[GEN] ✓ generated ticket",
+      ticketNumber,
+      "for staff",
+      staffId,
+      "→",
+      ticketId,
+    );
 
     return {
       success: true,
@@ -164,9 +176,13 @@ async function distributeTicketNumber(
 export async function distributeTicketToAvailableStaff(
   department: string,
 ): Promise<TicketNumberResult> {
+  console.log("═══════════════════════════════════════════════════════");
+  console.log("[DIST] CALLED for department:", department);
+
   try {
     const settings = await SystemSetting.findById(SYSTEM_SETTINGS_ID).lean();
     if ((settings as any)?.queueOpen === false) {
+      console.warn("[DIST] ✗ queue is closed by admin");
       return {
         success: false,
         failureReason: "queue-closed",
@@ -179,7 +195,13 @@ export async function distributeTicketToAvailableStaff(
       status: "active",
     }).lean();
 
+    console.log(
+      "[DIST] active staff in department:",
+      (departmentStaff as any[]).map((s) => s.staffId),
+    );
+
     if (!departmentStaff || departmentStaff.length === 0) {
+      console.warn("[DIST] ✗ no active staff");
       return {
         success: false,
         failureReason: "no-staff",
@@ -204,6 +226,20 @@ export async function distributeTicketToAvailableStaff(
           accepting: evaluation.accepting,
         };
       }),
+    );
+
+    console.log(
+      "[DIST] counter states:",
+      JSON.stringify(
+        counters.map((c) => ({
+          staffId: c.staffId,
+          load: c.load,
+          state: c.state,
+          accepting: c.accepting,
+        })),
+        null,
+        2,
+      ),
     );
 
     let eligible = counters.filter((c) => c.accepting);
@@ -231,9 +267,60 @@ export async function distributeTicketToAvailableStaff(
       };
     }
 
+    // ── CASHIER: window-aware smart pick ────────────────────────────────
+    if (department === "cashier") {
+      console.log("[DIST] ▶ entering cashier smart-pick branch");
+
+      const eligibleIds = new Set(eligible.map((c) => c.staffId));
+      console.log("[DIST] eligible staffIds:", Array.from(eligibleIds));
+
+      const pick = await chooseCashierStaffForNextTicket();
+      console.log("[DIST] balancer returned:", pick);
+
+      if (pick.staffId && eligibleIds.has(pick.staffId)) {
+        console.log(
+          "[DIST] ✓ using balancer pick:",
+          pick.staffId,
+          "from window",
+          pick.windowName,
+        );
+
+        const targetCounter = eligible.find((c) => c.staffId === pick.staffId)!;
+        const result = await distributeTicketNumber(pick.staffId, {
+          maxSeq: targetCounter.dailyLimit,
+        });
+
+        if (result.failureReason !== "capacity-reached") {
+          return result;
+        }
+        console.warn("[DIST] picked staff hit capacity, dropping and retrying");
+        eligible = eligible.filter((c) => c.staffId !== pick.staffId);
+      } else {
+        console.warn(
+          "[DIST] ✗ balancer pick NOT usable — " + "staffId =",
+          pick.staffId,
+          "| reason =",
+          pick.reason ?? "not-in-eligible-set",
+          "| eligible? =",
+          pick.staffId ? eligibleIds.has(pick.staffId) : false,
+        );
+      }
+    }
+
+    // ── Fallback: least-load per-staff round-robin ──────────────────────
+    console.log("[DIST] ▶ falling back to legacy least-load round-robin");
+
     while (eligible.length > 0) {
       const leastBusy = eligible.reduce((min, s) =>
         s.load < min.load ? s : min,
+      );
+
+      console.log(
+        "[DIST] legacy pick:",
+        leastBusy.staffId,
+        "(load",
+        leastBusy.load,
+        ")",
       );
 
       const result = await distributeTicketNumber(leastBusy.staffId, {
@@ -252,7 +339,7 @@ export async function distributeTicketToAvailableStaff(
       error: "Today's queue has reached capacity.",
     };
   } catch (error: any) {
-    console.error("Error distributing to available staff:", error);
+    console.error("[DIST] ✗ threw:", error);
     return {
       success: false,
       error: "Failed to distribute ticket to available staff",
